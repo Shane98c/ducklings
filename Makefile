@@ -294,3 +294,14 @@ help:
 	@echo "  make all             - Build everything"
 	@echo "  make duckdb-all      - Build browser and workers WASM"
 	@echo "  make typescript-all  - Build all TypeScript packages"
+
+# Local experimental build: full spatial, Parquet, and HTTP; no lakehouse extensions.
+.PHONY: duckdb-workers-spatial typescript-workers-spatial check-worker-spatial-size
+duckdb-workers-spatial:
+	./scripts/build-duckdb.sh workers-spatial
+
+typescript-workers-spatial:
+	pnpm --filter @ducklings/workers-spatial build
+
+check-worker-spatial-size:
+	bash scripts/check-worker-size.sh packages/example-cloudflare-worker-spatial

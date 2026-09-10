@@ -91,3 +91,6 @@ plans/
 manual-tests/
 scripts/test-local-worker.sh
 .pnpm-store/
+
+# Local benchmark artifacts
+benchmark/

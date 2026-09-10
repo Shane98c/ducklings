@@ -23,6 +23,12 @@ case "${TARGET}" in
         WORKERS_PROFILE="${WORKERS_PROFILE:-build}"
         WORKERS_FLAVOR="iceberg"
         ;;
+    workers-spatial|link-workers-spatial)
+        [ "$TARGET" = "link-workers-spatial" ] && LINK_ONLY=true
+        TARGET="workers"
+        WORKERS_PROFILE="${WORKERS_PROFILE:-build}"
+        WORKERS_FLAVOR="spatial"
+        ;;
     workers-ducklake)
         TARGET="workers"
         WORKERS_PROFILE="${WORKERS_PROFILE:-build}"
@@ -89,6 +95,7 @@ case "${TARGET}" in
         echo "  browser (default): Browser build with sync XMLHttpRequest"
         echo "  workers: Iceberg workers build optimized for Cloudflare deployment size"
         echo "  workers-ducklake: DuckLake workers build optimized for Cloudflare deployment size"
+        echo "  workers-spatial/link-workers-spatial: Experimental spatial build / re-link"
         echo "  link-workers/link-workers-ducklake: Link-only workers builds"
         echo "  release-workers/release-workers-ducklake: Production workers builds"
         echo "  debug-workers/debug-workers-ducklake: Local workers debug builds with symbols/assertions"
@@ -100,11 +107,11 @@ esac
 
 EXTENSION_FLAVOR="${WORKERS_FLAVOR}"
 case "${EXTENSION_FLAVOR}" in
-    iceberg|ducklake)
+    iceberg|ducklake|spatial)
         ;;
     *)
         echo "[ERROR] Unknown workers flavor: ${EXTENSION_FLAVOR}"
-        echo "Supported values: iceberg, ducklake"
+        echo "Supported values: iceberg, ducklake, spatial"
         exit 1
         ;;
 esac
@@ -361,6 +368,11 @@ if [ "$TARGET" = "workers" ]; then
     ASYNCIFY_REMOVE+="'*PhysicalRecursiveCTE*',"
     # mbedtls crypto (pure computation, never calls HTTP)
     ASYNCIFY_REMOVE+="'*mbedtls*'"
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ] && [ "${DUCKLINGS_SPATIAL_ASYNCIFY_TRIM:-1}" = "1" ]; then
+        # GEOS, SGL, and PROJ with networking disabled cannot suspend for HTTP.
+        # Keep GDAL and DuckDB's file readers instrumented: their VFS can yield.
+        ASYNCIFY_REMOVE+=",'*geos::*','GEOS*','*sgl::*','*osgeo::proj::*','proj_*','pj_*','geod_*'"
+    fi
     ASYNCIFY_REMOVE+="]"
     case "${ASYNCIFY_STRATEGY}" in
         ignore-indirect)
@@ -412,6 +424,7 @@ ICEBERG_SRC="${PROJECT_ROOT}/deps/duckdb-iceberg"
 AVRO_SRC="${PROJECT_ROOT}/deps/duckdb-avro"
 QUACK_SRC="${PROJECT_ROOT}/deps/duckdb-quack"
 DUCKLAKE_SRC="${PROJECT_ROOT}/deps/ducklake"
+SPATIAL_SRC="${PROJECT_ROOT}/deps/duckdb-spatial"
 NANOARROW_SRC="${PROJECT_ROOT}/deps/nanoarrow"
 HTTP_WASM_SRC="${PROJECT_ROOT}/src/http"
 ARROW_IPC_SRC="${PROJECT_ROOT}/src/arrow"
@@ -420,8 +433,13 @@ DIST_DIR="${PROJECT_ROOT}/dist"
 VCPKG_INSTALLED="${PROJECT_ROOT}/vcpkg_installed/wasm32-emscripten"
 VCPKG_BASELINE="84bab45d415d22042bd0b9081aea57f362da3f35"
 
+if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+    BUILD_DIR="${PROJECT_ROOT}/build/emscripten-spatial"
+    OUTPUT_SUFFIX="-workers-spatial"
+fi
+
 # Number of parallel jobs
-CORES=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+CORES=${DUCKLINGS_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}
 ICEBERG_CORES="${DUCKLINGS_ICEBERG_JOBS:-$CORES}"
 QUACK_CORES="${DUCKLINGS_QUACK_JOBS:-$CORES}"
 DUCKLAKE_CORES="${DUCKLINGS_DUCKLAKE_JOBS:-$CORES}"
@@ -619,6 +637,11 @@ check_duckdb_source() {
     fi
     log_info "HTTPFS source found at $HTTPFS_SRC"
 
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ] && [ ! -f "${SPATIAL_SRC}/CMakeLists.txt" ]; then
+        log_error "Spatial source is missing; initialize deps/duckdb-spatial"
+        exit 1
+    fi
+
     if [ "${EXTENSION_FLAVOR}" = "iceberg" ]; then
         if [ ! -d "$ICEBERG_SRC" ]; then
             log_error "Iceberg extension source not found at $ICEBERG_SRC"
@@ -698,6 +721,10 @@ apply_patches() {
 
     apply_patch_series "$DUCKDB_SRC" "${PATCH_ROOT}/duckdb" "duckdb"
     apply_patch_series "$HTTPFS_SRC" "${PATCH_ROOT}/duckdb-httpfs" "duckdb-httpfs"
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+        # The DuckDB 1.5.5 ResetStorage patch, refreshed for its pinned spatial source.
+        apply_patch_series "$SPATIAL_SRC" "${PATCH_ROOT}/duckdb-spatial" "duckdb-spatial"
+    fi
     if [ "${EXTENSION_FLAVOR}" = "iceberg" ]; then
         apply_patch_series "$AVRO_SRC" "${PATCH_ROOT}/duckdb-avro" "duckdb-avro"
         apply_patch_series "$ICEBERG_SRC" "${PATCH_ROOT}/duckdb-iceberg" "duckdb-iceberg"
@@ -753,7 +780,27 @@ configure_duckdb() {
         EXTENSION_CONFIG_OVERRIDE="$(prepare_duckdb_extension_config_override)"
     fi
 
+    local -a SPATIAL_CMAKE_FLAGS=()
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+        EXTENSION_CONFIG_OVERRIDE="${BUILD_DIR}/spatial_extension_config.cmake"
+        cat > "${EXTENSION_CONFIG_OVERRIDE}" << CMAKEEOF
+duckdb_extension_load(json DONT_BUILD)
+duckdb_extension_load(spatial SOURCE_DIR "${SPATIAL_SRC}" INCLUDE_DIR "${SPATIAL_SRC}/src/spatial")
+CMAKEEOF
+        SPATIAL_CMAKE_FLAGS=(
+            "-DCMAKE_TOOLCHAIN_FILE=${PROJECT_ROOT}/build/vcpkg/scripts/buildsystems/vcpkg.cmake"
+            "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=${EMSCRIPTEN_ROOT}/cmake/Modules/Platform/Emscripten.cmake"
+            "-DVCPKG_INSTALLED_DIR=${PROJECT_ROOT}/vcpkg_installed"
+            "-DVCPKG_TARGET_TRIPLET=wasm32-emscripten"
+            "-DVCPKG_MANIFEST_INSTALL=OFF"
+            "-DSPATIAL_USE_NETWORK=OFF"
+            "-DSPATIAL_USE_GEOS=ON"
+            "-DSPATIAL_USE_GDAL=${DUCKLINGS_SPATIAL_GDAL:-0}"
+        )
+    fi
+
     emcmake cmake "$DUCKDB_SRC" \
+        "${SPATIAL_CMAKE_FLAGS[@]}" \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHELL=OFF \
         -DBUILD_UNITTESTS=OFF \
@@ -785,6 +832,9 @@ build_duckdb() {
         EXTENSION_TARGETS=("json_extension" "${EXTENSION_TARGETS[@]}")
     fi
 
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+        EXTENSION_TARGETS+=("spatial_extension")
+    fi
     local ext=""
     for ext in "${EXTENSION_TARGETS[@]}"; do
         if grep -q "^${ext}:" Makefile 2>/dev/null; then
@@ -962,6 +1012,29 @@ build_arrow_ipc_insert() {
 
 build_vcpkg_deps() {
     log_info "Building vcpkg dependencies for wasm32-emscripten..."
+
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+        # Reuse spatial's Wasm-tested dependency manifest and overlay ports.
+        # No AWS SDK, Iceberg, Avro, or DuckLake dependencies are installed.
+        local VCPKG_DIR="${PROJECT_ROOT}/build/vcpkg"
+        if [ ! -d "${VCPKG_DIR}/.git" ]; then
+            git clone https://github.com/microsoft/vcpkg.git "${VCPKG_DIR}"
+        fi
+        git -C "${VCPKG_DIR}" checkout "${VCPKG_BASELINE}"
+        if [ ! -x "${VCPKG_DIR}/vcpkg" ]; then
+            "${VCPKG_DIR}/bootstrap-vcpkg.sh" -disableMetrics
+        fi
+        export VCPKG_ROOT="${VCPKG_DIR}"
+        export EMSCRIPTEN_ROOT="$(em-config EMSCRIPTEN_ROOT)"
+        local MANIFEST_DIR="${BUILD_DIR}/vcpkg-manifest"
+        python3 "${PROJECT_ROOT}/scripts/spatial-vcpkg-manifest.py" \
+            "${SPATIAL_SRC}" "${MANIFEST_DIR}" "${DUCKLINGS_SPATIAL_GDAL:-0}"
+        "${VCPKG_DIR}/vcpkg" install \
+            --triplet wasm32-emscripten \
+            --x-manifest-root="${MANIFEST_DIR}" \
+            --x-install-root="${PROJECT_ROOT}/vcpkg_installed"
+        return
+    fi
 
     # Check if already built
     if [ -f "${VCPKG_INSTALLED}/lib/libroaring.a" ] && [ -f "${VCPKG_INSTALLED}/lib/libavro.a" ] && [ -f "${VCPKG_INSTALLED}/lib/libaws-cpp-sdk-core.a" ]; then
@@ -1379,6 +1452,13 @@ find_duckdb_libraries() {
         done
     fi
 
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+        # Include the extension's own helper archives and static dependencies.
+        # wasm-ld resolves archive references lazily across the full link.
+        LIBS="${LIBS} $(find "${BUILD_DIR}/extension/spatial" -name '*.a' -type f | sort | tr '\n' ' ')"
+        LIBS="${LIBS} $(find "${VCPKG_INSTALLED}/lib" -name '*.a' -type f | sort | tr '\n' ' ')"
+    fi
+
     echo "${LIBS}"
 }
 
@@ -1394,7 +1474,15 @@ link_wasm_module() {
     local PRELOADED_FLAGS=""
     local EXTENSION_LOADS=""
     local EXTENSION_LOAD_COMMENT=""
-    if [ "${EXTENSION_FLAVOR}" = "ducklake" ]; then
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+        PRELOADED_FLAGS='bool preloaded_httpfs = true;
+bool preloaded_avro = false;
+bool preloaded_iceberg = false;
+bool preloaded_ducklake = false;
+bool preloaded_quack = false;'
+        EXTENSION_LOADS='duckdb_instance.LoadStaticExtension<duckdb::HttpfsExtension>();'
+        EXTENSION_LOAD_COMMENT='// Spatial is registered by the generated static extension loader.'
+    elif [ "${EXTENSION_FLAVOR}" = "ducklake" ]; then
         EXTENSION_INCLUDES='#include "quack_extension.hpp"
 #include "ducklake_extension.hpp"'
         PRELOADED_FLAGS='bool preloaded_httpfs = true;
@@ -1685,6 +1773,8 @@ MAINEOF
         -I"${AVRO_SRC}/src/include" \
         -I"${QUACK_SRC}/src/include" \
         -I"${DUCKLAKE_SRC}/src/include" \
+        -I"${SPATIAL_SRC}/src" \
+        -I"${SPATIAL_SRC}/src/spatial" \
         -I"${VCPKG_INSTALLED}/include" \
         -s WASM=1 \
         -s MODULARIZE=1 \
@@ -1693,9 +1783,9 @@ MAINEOF
         -s FILESYSTEM=1 \
         -s FORCE_FILESYSTEM=1 \
         -s MALLOC=emmalloc \
-        -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
+        -s ERROR_ON_UNDEFINED_SYMBOLS=$([ "${EXTENSION_FLAVOR}" = "spatial" ] && echo 1 || echo 0) \
         -s ALLOW_MEMORY_GROWTH=1 \
-        $([ "$TARGET" = "workers" ] && echo "-s MAXIMUM_MEMORY=128MB" || echo "-s MAXIMUM_MEMORY=4GB") \
+        $([ "${EXTENSION_FLAVOR}" = "spatial" ] && echo "-s MAXIMUM_MEMORY=96MB" || { [ "$TARGET" = "workers" ] && echo "-s MAXIMUM_MEMORY=128MB" || echo "-s MAXIMUM_MEMORY=4GB"; }) \
         -s STACK_SIZE=1048576 \
         -s NO_EXIT_RUNTIME=1 \
         -s DISABLE_EXCEPTION_CATCHING=0 \
@@ -1803,7 +1893,9 @@ print_summary() {
     fi
 
     echo ""
-    if [ "${EXTENSION_FLAVOR}" = "ducklake" ]; then
+    if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+        log_info "Built with static extensions: parquet, httpfs, spatial (GEOS + PROJ; GDAL=${DUCKLINGS_SPATIAL_GDAL:-0})"
+    elif [ "${EXTENSION_FLAVOR}" = "ducklake" ]; then
         log_info "Built with static extensions: httpfs, quack client, ducklake (WASM HTTP client)"
     else
         log_info "Built with static extensions: httpfs, avro, iceberg (WASM HTTP client)"
@@ -1815,7 +1907,10 @@ print_summary() {
     fi
     log_info "Next steps:"
     if [ "$TARGET" = "workers" ]; then
-        if [ "${EXTENSION_FLAVOR}" = "ducklake" ]; then
+        if [ "${EXTENSION_FLAVOR}" = "spatial" ]; then
+            log_info "  1. Build TypeScript package: make typescript-workers-spatial"
+            log_info "  2. Run local test: pnpm --filter @ducklings/example-cloudflare-worker-spatial test"
+        elif [ "${EXTENSION_FLAVOR}" = "ducklake" ]; then
             log_info "  1. Build TypeScript package: make typescript-workers-ducklake"
             log_info "  2. Build example: pnpm --filter @ducklings/example-cloudflare-worker-ducklake build"
         else
@@ -1854,7 +1949,7 @@ main() {
         if [ "${EXTENSION_FLAVOR}" = "ducklake" ]; then
             build_quack_client
             build_ducklake
-        else
+        elif [ "${EXTENSION_FLAVOR}" = "iceberg" ]; then
             build_avro
             build_iceberg
         fi
