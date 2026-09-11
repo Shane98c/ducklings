@@ -1,0 +1,123 @@
+# Builds the spatial Workers SDK (@ducklings/workers-spatial) and attaches the
+# packed package to a release keyed by commit, so a consumer can fetch the
+# build for a pinned revision instead of running Emscripten itself:
+#
+#   https://github.com/<owner>/ducklings/releases/download/spatial-sdk-<sha>/ducklings-workers-spatial-<sha>.tgz
+#
+# The asset ships only after the package's own smoke test has passed against
+# the freshly built Wasm in local workerd.
+name: Spatial SDK
+
+on:
+  push:
+    branches: [spatial-workers]
+  workflow_dispatch:
+
+env:
+  EMSDK_VERSION: "4.0.22"
+  NODE_VERSION: "22"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spatial-sdk-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: ${{ env.EMSDK_VERSION }}
+          actions-cache-folder: "emsdk-cache"
+
+      - name: Add Emscripten upstream tools to PATH
+        run: echo "$EMSDK/upstream/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          which emcc
+          emcc -v
+          which wasm-opt
+          wasm-opt --version
+
+      - name: Cache vcpkg installed packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_installed
+          key: vcpkg-wasm32-spatial-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg_ports/**', 'scripts/spatial-vcpkg-manifest.py') }}
+
+      - name: Cache spatial DuckDB build
+        uses: actions/cache@v6
+        with:
+          path: build/emscripten-spatial
+          key: duckdb-wasm-spatial-${{ runner.os }}-${{ env.EMSDK_VERSION }}-${{ hashFiles('scripts/build-duckdb.sh', 'Makefile', 'patches/**', 'vcpkg.json', 'vcpkg_ports/**', 'src/**', '.gitmodules') }}
+          restore-keys: |
+            duckdb-wasm-spatial-${{ runner.os }}-${{ env.EMSDK_VERSION }}-
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Clean stale CMake cache
+        run: rm -rf build/emscripten-spatial/CMakeCache.txt build/emscripten-spatial/CMakeFiles
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build spatial Wasm
+        run: make duckdb-workers-spatial
+
+      - name: Build the package
+        run: make typescript-workers-spatial
+
+      - name: Check the Worker bundle size
+        run: make check-worker-spatial-size
+
+      - name: Smoke test in local workerd
+        run: pnpm --filter @ducklings/example-cloudflare-worker-spatial test
+
+      - name: Pack
+        id: pack
+        run: |
+          mkdir -p release
+          pnpm --filter @ducklings/workers-spatial pack --pack-destination "$PWD/release"
+          packed="$(ls release/*.tgz)"
+          asset="release/ducklings-workers-spatial-${GITHUB_SHA}.tgz"
+          mv "$packed" "$asset"
+          sha256sum "$asset" | cut -d' ' -f1 > "$asset.sha256"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          ls -la release
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ steps.pack.outputs.asset }}
+        run: |
+          tag="spatial-sdk-${GITHUB_SHA}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$ASSET" "$ASSET.sha256" --clobber
+          else
+            gh release create "$tag" "$ASSET" "$ASSET.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "Spatial SDK ${GITHUB_SHA:0:12}" \
+              --notes "@ducklings/workers-spatial built from ${GITHUB_SHA} with Emscripten ${EMSDK_VERSION}. Fetch with the tag and the sha256 beside the asset."
+          fi
