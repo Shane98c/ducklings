@@ -24,7 +24,7 @@ mergeInto(LibraryManager.library, {
         }
 
         return Asyncify.handleAsync(function() {
-            return fetch(url, {
+            return (Module["httpFetch"] || fetch)(url, {
                 method: "HEAD",
                 headers: headers
             }).then(function(response) {
@@ -126,7 +126,7 @@ mergeInto(LibraryManager.library, {
 
         console.log(">>", method, url.substring(url.lastIndexOf('/') + 1));
         return Asyncify.handleAsync(function() {
-            return fetch(url, fetchOptions).then(function(response) {
+            return (Module["httpFetch"] || fetch)(url, fetchOptions).then(function(response) {
                 return response.arrayBuffer().then(function(responseBody) {
                     if (method !== "GET" || !response.ok) {
                         console.log("<<", method, response.status, url.substring(url.lastIndexOf('/')));

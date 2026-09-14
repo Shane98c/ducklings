@@ -397,6 +397,8 @@ export interface InitOptions {
    * ```
    */
   wasmModule: WebAssembly.Module;
+  /** Optional transport for httpfs requests; fixed for the module lifetime. */
+  httpFetch?: (url: string, init: RequestInit) => Promise<Response>;
 }
 
 /**
@@ -446,6 +448,7 @@ export async function init(options: InitOptions): Promise<void> {
 
     // Initialize the Emscripten module with pre-compiled WASM
     const config: Record<string, unknown> = {
+      httpFetch: options.httpFetch,
       instantiateWasm: (
         imports: WebAssembly.Imports,
         receiveInstance: (instance: WebAssembly.Instance) => void,
@@ -1070,6 +1073,7 @@ export class PreparedStatement {
     const mod = getModule();
 
     const resultPtr = mod._malloc(64);
+    mod.HEAPU8.fill(0, resultPtr, resultPtr + 64);
     try {
       const status = (await mod.ccall(
         'duckdb_execute_prepared',
@@ -1089,7 +1093,6 @@ export class PreparedStatement {
         const errorMsg = errorPtr
           ? mod.UTF8ToString(errorPtr)
           : 'Prepared statement execution failed';
-        mod.ccall('duckdb_destroy_result', null, ['number'], [resultPtr]);
         throw new DuckDBError(errorMsg, undefined, this.sql);
       }
 
@@ -1160,10 +1163,13 @@ export class PreparedStatement {
         rows[rowIdx] = row as T;
       }
 
-      mod.ccall('duckdb_destroy_result', null, ['number'], [resultPtr]);
       return rows;
     } finally {
-      mod._free(resultPtr);
+      try {
+        mod.ccall('duckdb_destroy_result', null, ['number'], [resultPtr]);
+      } finally {
+        mod._free(resultPtr);
+      }
     }
   }
 
@@ -2487,6 +2493,46 @@ export class Connection {
       return new PreparedStatement(stmtPtr, this.connPtr, sql);
     } finally {
       module._free(stmtPtrPtr);
+    }
+  }
+
+  /**
+   * Prepares SQL asynchronously.
+   * Required when binding may read remote metadata, such as a Parquet schema.
+   */
+  async prepareAsync(sql: string): Promise<PreparedStatement> {
+    if (this.closed || !module) {
+      throw new DuckDBError('Connection is closed');
+    }
+    const mod = module;
+    const stmtPtrPtr = mod._malloc(4);
+    mod.setValue(stmtPtrPtr, 0, 'i32');
+    try {
+      const result = (await mod.ccall(
+        'duckdb_prepare',
+        'number',
+        ['number', 'string', 'number'],
+        [this.connPtr, sql, stmtPtrPtr],
+        { async: true },
+      )) as number;
+      const stmtPtr = mod.getValue(stmtPtrPtr, '*');
+      if (result !== 0) {
+        let error = 'Failed to prepare statement';
+        if (stmtPtr) {
+          const errorPtr = mod.ccall(
+            'duckdb_prepare_error',
+            'number',
+            ['number'],
+            [stmtPtr],
+          ) as number;
+          if (errorPtr) error = mod.UTF8ToString(errorPtr);
+          mod.ccall('duckdb_destroy_prepare', null, ['number'], [stmtPtrPtr]);
+        }
+        throw new DuckDBError(error, undefined, sql);
+      }
+      return new PreparedStatement(stmtPtr, this.connPtr, sql);
+    } finally {
+      mod._free(stmtPtrPtr);
     }
   }
 
