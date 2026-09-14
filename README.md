@@ -11,6 +11,9 @@ A minimal DuckDB WASM build for browsers and Cloudflare Workers.
 | [`@ducklings/browser`](https://www.npmjs.com/package/@ducklings/browser) | Browser version (async API) | `npm install @ducklings/browser` |
 | [`@ducklings/workers`](https://www.npmjs.com/package/@ducklings/workers) | Cloudflare Workers version with Iceberg (async API) | `npm install @ducklings/workers` |
 | [`@ducklings/workers-ducklake`](https://www.npmjs.com/package/@ducklings/workers-ducklake) | Cloudflare Workers version with DuckLake (async API) | `npm install @ducklings/workers-ducklake` |
+| `@ducklings/workers-spatial` | Cloudflare Workers build with Spatial, Parquet, and httpfs | Build from source |
+
+The spatial package statically links DuckDB Spatial with GEOS and PROJ while omitting GDAL by default to reduce its Worker size. See [Spatial support for Cloudflare Workers](docs/spatial-workers.md) for build instructions, usage, and limitations.
 
 ## Documentation 
 
